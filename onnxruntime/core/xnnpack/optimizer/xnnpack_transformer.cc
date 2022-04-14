@@ -131,17 +131,26 @@ static Status TransposeInput(Graph& main_graph, const std::vector<int64_t>& inpu
 
 static Status TransposeOutput(Graph& main_graph, const std::vector<int64_t>& output_perm, int output_index, Node& node,
                               Node** new_node) {
+  // We need to generate a new node arg for the input of the new transpose node. Here we have two choices:
+  // 1. Create a node arg and add the nodearg to the tranpose node first. In this case when we create the node arg
+  //  we need to copy the type information from the original node's old node arg to this new node arg. Then we manually
+  //  update the old node's output def, let it points to this new node arg.
+  // 2. Create a node arg with null type information and attach it to the old node first. Then use "AddEdge" to update
+  // the transpose node's input.
   std::string output_name = main_graph.GenerateNodeArgName("trans");
-  NodeArg& transpose_output = main_graph.GetOrCreateNodeArg(output_name, nullptr);
+  NodeArg& transpose_input = main_graph.GetOrCreateNodeArg(output_name, nullptr);
   InOutDefSlot src_slot{ArgType::kOutput, output_index};
-
-  Node& transpose_node = main_graph.AddNode("", "Transpose", "", {}, {&transpose_output}, nullptr, kOnnxDomain);
+  Node& transpose_node = main_graph.AddNode("", "Transpose", "", {&transpose_input}, {}, nullptr, kOnnxDomain);
   transpose_node.AddAttribute("perm", output_perm);
+  node.MutableOutputDefs()[output_index]->ClearShape();
   // Append a single slot to dest. As the dest is empty, it will be the first one.
-  XNNPACK_RETURN_IF_ERROR(
-      MoveInputOutput(main_graph, node, transpose_node, ValueMoveInfo(src_slot, ArgType::kInput, false, false), false));
-  XNNPACK_RETURN_IF_ERROR(main_graph.UpdateShapeInference(transpose_node));
+  XNNPACK_RETURN_IF_ERROR(MoveInputOutput(main_graph, node, transpose_node,
+                                          ValueMoveInfo(src_slot, ArgType::kOutput, false, false), false));
+  node.MutableOutputDefs()[output_index] = &transpose_input;
   main_graph.AddEdge(node.Index(), transpose_node.Index(), output_index, 0);
+  XNNPACK_RETURN_IF_ERROR(main_graph.UpdateShapeInference(node));
+  XNNPACK_RETURN_IF_ERROR(main_graph.UpdateShapeInference(transpose_node));
+
   if (new_node) {
     *new_node = &transpose_node;
   }
@@ -172,14 +181,19 @@ Status AddBiasInitializer(Graph& main_graph, int64_t bias_size, const std::strin
   return Status::OK();
 }
 
+// It assumes the new node has the same number of inputs/outputs as the old node. And types of each node arg do not
+// change. For each node arg, only the shape may change.
 static Status ReplaceNode(Graph& main_graph, Node& old_node, const std::string& op_type, const std::string& description,
                           const NodeAttributes* attributes, const std::string& domain, Node** out) {
   Node& new_node = main_graph.AddNode(old_node.Name(), op_type, description, {}, {}, attributes, domain);
 
+  // Move all the inputs to the new node
   ValueMoveInfo move_info(ArgType::kInput, ArgType::kInput);
   XNNPACK_RETURN_IF_ERROR(MoveInputOutput(main_graph, old_node, new_node, move_info, false));
+  // Move all the outputs to the new node
   ValueMoveInfo move_info2(ArgType::kOutput, ArgType::kOutput);
   XNNPACK_RETURN_IF_ERROR(MoveInputOutput(main_graph, old_node, new_node, move_info2, false));
+  // Clear output shapes.
   for (NodeArg* p : new_node.MutableOutputDefs()) {
     if (p) p->ClearShape();
   }
