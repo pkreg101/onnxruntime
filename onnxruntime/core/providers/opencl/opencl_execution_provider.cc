@@ -81,7 +81,7 @@ bool ShouldFlushAfterLaunch(const std::string& device_name) {
 }  // namespace opencl
 
 OpenCLExecutionProvider::OpenCLExecutionProvider(const OpenCLExecutionProviderInfo& info)
-    : IExecutionProvider(kOpenCLExecutionProvider), use_fp16_(info.use_fp16) {
+    : IExecutionProvider(kOpenCLExecutionProvider), use_fp16_(info.use_fp16), enable_auto_tune_(info.enable_auto_tune) {
   Status status;
 #ifdef CL3W_ENABLE
   if (cl3wInit() != CL3W_OK) {
@@ -106,6 +106,7 @@ OpenCLExecutionProvider::~OpenCLExecutionProvider() {
 #endif
 
   clReleaseCommandQueue(cmd_queue_);
+  clReleaseCommandQueue(cmd_tune_queue_);
   clReleaseDevice(dev_);
   clReleaseContext(ctx_);
 }
@@ -231,6 +232,7 @@ Status OpenCLExecutionProvider::InitOpenCLContext() {
   GetCLDevInfo(dev_, CL_DEVICE_IMAGE2D_MAX_WIDTH, &dev_info_.image_2d_max_size[0]);
   GetCLDevInfo(dev_, CL_DEVICE_IMAGE2D_MAX_HEIGHT, &dev_info_.image_2d_max_size[1]);
 
+  cmd_tune_queue_ = clCreateCommandQueue(ctx_, dev_, /*properties=*/CL_QUEUE_PROFILING_ENABLE, &err);
 #ifdef TRACY_ENABLE
   cmd_queue_ = clCreateCommandQueue(ctx_, dev_, CL_QUEUE_PROFILING_ENABLE, &err);
 #else
@@ -311,9 +313,83 @@ static std::vector<size_t> AdrenoLocalSize2D(const opencl::NDRange& gws, const o
   return lws;
 }
 
-opencl::NDRange OpenCLExecutionProvider::DefaultLocalWG2DWithoutTune(const opencl::NDRange& gws) const {
+opencl::NDRange RunTuneLWS2D(const opencl::NDRange& gws, opencl::OpenCLDeviceInfo dev_info_, const opencl::TuneKernelWithTimeFunc& func) {
+  auto maxWorkGroupSize = dev_info_.max_work_group_size;
+  auto maxWorkItemSizes = dev_info_.max_work_item_size;
+  std::vector<size_t> lws_prefer(2, 1);
+  std::vector<size_t> lws(2, 1);
+  double default_lws_tc = func(opencl::NDRange(), gws);//get default tc
+  double min_cost = default_lws_tc;
+  auto valid_lws2d_checker = [&]()->bool {
+    if (lws[0] > gws[0]) return false;
+    if (lws[0] <= maxWorkItemSizes[0] && lws[1] <= maxWorkItemSizes[1] && lws[0] * lws[1] <= maxWorkGroupSize) {
+      return true;
+    }
+    return false;
+  };
+
+  auto update_lws_step = [&]() {         
+      //in some mobile GPUs, global size must be divisible by local-size
+    std::vector<size_t> internalGlobalWS(2, 1);
+    for (size_t i = 0; i < gws.Size(); ++i) {
+      internalGlobalWS[i] = ROUND_UP(gws[i], std::max<size_t>(1, lws[i]));
+    }
+    opencl::NDRange g(internalGlobalWS);
+    opencl::NDRange l(lws);
+    double cost_time = func(l, g);
+    if (cost_time < min_cost) {
+      min_cost = cost_time;
+      lws_prefer[0] = lws[0];
+      lws_prefer[1] = lws[1];
+    };
+  };
+  if (dev_info_.gpu_type == opencl::GpuType::ADRENO) {
+    for (lws[0] = 1; lws[0] <= 16; lws[0] *= 2) {          // dim0
+      for (lws[1] = 32; lws[1] <= 256; lws[1] *= 4) {  // dim1
+        if (!valid_lws2d_checker() || lws[0] * lws[1]<128) {
+          continue;
+        }
+        update_lws_step();
+      }
+    }
+    
+  } else {
+    bool fast_return = false;
+    for (lws[0] = 2; lws[0] <= 16; lws[0] *= 2) {      // dim0
+      for (lws[1] = 2; lws[1] <= 64; lws[1] *= 2) {  // dim1
+        if (!valid_lws2d_checker() || lws[0] * lws[1] < 8) {
+          continue;
+        }
+        update_lws_step();
+        if (min_cost <= 0.5 * default_lws_tc) {
+          fast_return = true;
+          break;
+        }
+      }
+      //if (fast_return) {
+      //  break;
+      //}
+    }
+  }
+  return opencl::NDRange(lws_prefer);
+}
+
+
+opencl::NDRange OpenCLExecutionProvider::DefaultLocalWG2DOrTune(const opencl::NDRange& gws, const opencl::TuneKernelWithTimeFunc& func) const {
+  /*
+  //read well-tuned local_size from cache
+  auto& tunedLws = runtime->tunedLwsMap();
+  std::pair<std::string, std::vector<uint32_t>> info = std::make_pair(kernelName, gws);
+  if (tunedLws.find(info) != tunedLws.end()) {
+    return tunedLws[info];
+  }
+  */
+  if (TuneEnabled()) {
+    return RunTuneLWS2D(gws, dev_info_, func);
+  }
+
   if (dev_info_.gpu_type != opencl::GpuType::ADRENO) {
-    return {};
+    return opencl::NDRange();
   }
   std::vector<size_t> lwgs(2);
   if (dev_info_.max_work_group_size == 0) {
@@ -322,9 +398,9 @@ opencl::NDRange OpenCLExecutionProvider::DefaultLocalWG2DWithoutTune(const openc
     lwgs = AdrenoLocalSize2D(gws, dev_info_);
   }
   if (lwgs.size() == 0) {
-    return {};
+    return opencl::NDRange();
   }
-  return {lwgs[0], lwgs[1]};
+  return opencl::NDRange(lwgs[0], lwgs[1]);
 }
 
 void OpenCLExecutionProvider::RegisterAllocator(std::shared_ptr<AllocatorManager> /*allocator_manager*/) {

@@ -115,6 +115,7 @@
   VLOGS_DEFAULT(V_TENSOR) << std::setfill(' ') << std::setw(9) << (desc) \
                           << " shape " << (shape)                        \
                           << " PrePack(" << ptr << ")";
+#define ROUND_UP(x, y) (((x) + (y) - (1)) / (y) * (y))
 
 namespace onnxruntime {
 namespace opencl {
@@ -138,6 +139,13 @@ class NDRange {
 
   template <typename T>
   explicit NDRange(T x) : values_{static_cast<size_t>(x)} {}
+
+  template <typename T>
+  explicit NDRange(const std::vector<T>& vx) {
+    for (auto v : vx) {
+      values_.push_back(static_cast<size_t>(v));
+    }
+  }
 
   template <typename T1, typename T2>
   NDRange(T1 x, T2 y) : values_{static_cast<size_t>(x), static_cast<size_t>(y)} {}
@@ -186,6 +194,7 @@ class NDRange {
  private:
   ValueType values_;
 };
+typedef std::function<double(const opencl::NDRange& lws, const opencl::NDRange& gws)> TuneKernelWithTimeFunc;
 
 const char* GetErrorString(cl_int error_code);
 

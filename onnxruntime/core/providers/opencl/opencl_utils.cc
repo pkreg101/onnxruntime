@@ -149,14 +149,48 @@ Status KernelLauncher::Launch(const OpenCLExecutionProvider& exec, const NDRange
                           << " with global work size: " << global.ToString()
                           << " local work size: " << local.ToString();
   NDRange local_ (local);
+  NDRange global_(global);
+  opencl::TuneKernelWithTimeFunc func = [&](const NDRange& l, const NDRange& g) -> double {
+    std::string build_errmsg = "[error occored in tuning local-size,local--gobal:" + l.ToString() + g.ToString();
+    //try run, sometimes we got weird error;
+    if (clEnqueueNDRangeKernel(exec.GetCommandQueueForTune(), kernel_, g.Size(), nullptr,
+                               g.Data(), l.Data(), 0, nullptr, nullptr) != 0) {
+      return ULONG_MAX;
+    }
+    double avg_tc = 0;
+    for (size_t repeat = 0; repeat < 5; ++repeat) {
+      cl_event event;
+      ORT_THROW_IF_CL_ERROR(clEnqueueNDRangeKernel(exec.GetCommandQueueForTune(), kernel_, g.Size(), nullptr,
+                                                   g.Data(), l.Data(), 0, nullptr, &event),
+                            build_errmsg);
+      cl_int res = clWaitForEvents(1, &event);
+      ORT_THROW_IF_CL_ERROR(res, "event");
+      cl_ulong starttime, endtime;
+      res = clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &starttime, NULL);
+      ORT_THROW_IF_CL_ERROR(res);
+      res = clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &endtime, NULL);
+      ORT_THROW_IF_CL_ERROR(res);
+      avg_tc += ((endtime - starttime) / 1000.0);
+    }
+
+    return avg_tc / 5;
+  };
   if (local.Size() == 0) {
     if (global.Size() == 2) {
       auto v_cache = const_cast<OpenCLExecutionProvider&>(exec).GetProgramManager().GetLocalSizeUsingGlobal(global);
       if (v_cache.has_value()) {
         local_ = v_cache.value();
       } else {
-        local_ = exec.DefaultLocalWG2DWithoutTune(global);
+        local_ = exec.DefaultLocalWG2DOrTune(global, func);
         const_cast<OpenCLExecutionProvider&>(exec).GetProgramManager().SetLocalSizeUsingGlobal(global, local_);
+      }
+      if (local_.Size() == global_.Size()) {
+        // in some mobile GPUs, global size must be divisible by local-size
+        absl::InlinedVector<size_t, 2> internalGlobalWS{global[0], global[1]};
+        for (size_t i = 0; i < global_.Size(); ++i) {
+          internalGlobalWS[i] = ROUND_UP(global_[i], std::max<size_t>(1, local_[i]));
+        }
+        global_ = NDRange(internalGlobalWS[0], internalGlobalWS[1]);
       }
     } else {
         //TODO 3D kernel
@@ -172,8 +206,8 @@ Status KernelLauncher::Launch(const OpenCLExecutionProvider& exec, const NDRange
     TracyCLZoneSetEvent(kernel_launch_event);
   }
 #else
-  ORT_RETURN_IF_CL_ERROR(clEnqueueNDRangeKernel(exec.GetCommandQueue(), kernel_, global.Size(), nullptr,
-                                                global.Data(), local_.Data(), 0, nullptr, nullptr));
+  ORT_RETURN_IF_CL_ERROR(clEnqueueNDRangeKernel(exec.GetCommandQueue(), kernel_, global_.Size(), nullptr,
+                                                global_.Data(), local_.Data(), 0, nullptr, nullptr));
 #endif
   return exec.AfterCLLaunch();
 }

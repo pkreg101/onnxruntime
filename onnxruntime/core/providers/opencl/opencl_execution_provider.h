@@ -38,6 +38,7 @@ namespace onnxruntime {
 // Information needed to construct OpenCL execution providers.
 struct OpenCLExecutionProviderInfo {
   bool use_fp16;
+  bool enable_auto_tune;
 };
 namespace opencl {
 enum class GpuType;
@@ -75,6 +76,7 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   cl_device_id GetOpenCLDevice() const { return dev_; }
   cl_context GetOpenCLContext() const { return ctx_; }
   cl_command_queue GetCommandQueue() const { return cmd_queue_; }
+  cl_command_queue GetCommandQueueForTune() const { return cmd_tune_queue_; }
 
   /// Get an OpenCL Buffer for temporary usage from Buffer allocator.
   IAllocatorUniquePtrToClMem GetScratchBuffer(size_t nbytes) const;
@@ -88,7 +90,7 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   /// Whether fp16 is enabled. Used by Image2D allocator to decide the datatype
   /// and OpenCLProgramManager to build kernels.
   bool UseFp16() const { return use_fp16_; }
-
+  bool TuneEnabled() const { return enable_auto_tune_; }
   /// OpenCL after kernel launch performance heuristic. This is called in
   /// KernelLauncher
   Status AfterCLLaunch() const;
@@ -97,7 +99,7 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   const opencl::OpenCLProgramManager& GetProgramManager() const;
   opencl::OpenCLProgramManager& GetProgramManager();
 
-  opencl::NDRange DefaultLocalWG2DWithoutTune(const opencl::NDRange& gws) const;
+  opencl::NDRange DefaultLocalWG2DOrTune(const opencl::NDRange& gws, const opencl::TuneKernelWithTimeFunc& func) const;
 
  private:
   Status InitOpenCLContext();
@@ -106,7 +108,9 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   cl_device_id dev_;
   cl_context ctx_;
   cl_command_queue cmd_queue_;
+  cl_command_queue cmd_tune_queue_;
   bool use_fp16_;
+  bool enable_auto_tune_;
   bool flush_after_launch_;
   opencl::OpenCLDeviceInfo dev_info_;
 

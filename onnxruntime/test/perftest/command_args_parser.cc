@@ -85,6 +85,10 @@ namespace perftest {
       "\t    [NNAPI only] [NNAPI_FLAG_CPU_ONLY]: Using CPU only in NNAPI EP.\n"
       "\t [Usage]: -e <provider_name> -i '<key1> <key2>'\n\n"
       "\t [Example] [For NNAPI EP] -e nnapi -i \" NNAPI_FLAG_USE_FP16 NNAPI_FLAG_USE_NCHW NNAPI_FLAG_CPU_DISABLED \"\n"
+      "\t    [OPENCL only] [use_fp16]: Use fp16 relaxation in opencl EP..\n"
+      "\t    [OPENCL only] [auto_tune]: auto tuning local-size in OPENCL EP.\n"
+      "\t [Usage]: -e <provider_name> -i '<key1> <key2>'\n\n"
+      "\t [Example] [For OPENCL EP] -e opencl -i \" use_fp16 use_fp16  \"\n"
       "\t-h: help\n");
 }
 #ifdef _WIN32
